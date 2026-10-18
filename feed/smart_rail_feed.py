@@ -22,6 +22,7 @@ map.
 
 import heapq
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -42,13 +43,16 @@ DIM_TO_MAP = {
 # The rails are ONE physical network shared by both traffic kinds, so an edge is
 # labelled by the stations that route across it (shortest paths within each
 # station group): passenger-only, cargo-only, shared, or on no route at all.
-TRAFFIC = ("person", "cargo", "mixed", "none")
+TRAFFIC = ("person", "cargo", "none")
 TRACK_LABEL = {
     "person": "Personenverkehr",
     "cargo": "Warenverkehr",
-    "mixed": "gemischt genutzt",
+    "mixed": "gemeinsame Strecke",
     "none": "ohne Durchgangsverkehr",
 }
+# Shared stretches are drawn as TWO parallel lines instead of one mixed colour,
+# so both services stay readable on the same physical rails.
+PARALLEL_OFFSET = 0.6
 TRACK_COLOR = {
     "person": {"r": 34, "g": 199, "b": 255, "a": 0.95},
     "cargo": {"r": 255, "g": 140, "b": 42, "a": 0.95},
@@ -117,6 +121,28 @@ def atomic_write(path, text):
     except (ImportError, KeyError, OSError):
         pass
     os.rename(tmp, path)
+
+
+def offset_cells(cells, off):
+    """Shift a polyline sideways in the XZ plane by `off` blocks.
+
+    Needed to draw two services that share the same rails as parallel lines.
+    The direction at each vertex is the average of its neighbours, the offset
+    goes along the left-hand perpendicular (miter approximation).
+    """
+    if off == 0 or len(cells) < 2:
+        return [list(c) for c in cells]
+    out = []
+    for i, c in enumerate(cells):
+        prev = cells[max(0, i - 1)]
+        nxt = cells[min(len(cells) - 1, i + 1)]
+        dx, dz = nxt[0] - prev[0], nxt[2] - prev[2]
+        dist = math.hypot(dx, dz)
+        if dist == 0:
+            out.append(list(c))
+            continue
+        out.append([c[0] + (-dz / dist) * off, c[1], c[2] + (dx / dist) * off])
+    return out
 
 
 def classify_traffic(edge_list, station_list, radius=4, dy=3):
@@ -233,19 +259,30 @@ def main():
             cells = e["cells"]
             if len(cells) < 2:
                 continue
+            cls = labels.get(e["eid"], "none")
             xs = [c[0] for c in cells]
             zs = [c[2] for c in cells]
             ys = [c[1] for c in cells]
-            cls = labels.get(e["eid"], "none")
-            bucket["tracks"].setdefault(cls, []).append({
-                "id": "track-%d" % e["eid"], "type": "line", "map": mp,
-                "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + 1.6,
-                                sum(zs) / len(zs) + 0.5),
-                "line": [vec(c[0] + 0.5, c[1] + 0.6, c[2] + 0.5) for c in cells],
-                "label": "%s: %s \u2192 #%d" % (TRACK_LABEL[cls], e["arm"].upper(), e["dst"]),
-                "detail": "L\u00e4nge: %d Bl\u00f6cke" % e["len"],
-                "depthTest": False, "lineWidth": 3,
-                "lineColor": TRACK_COLOR[cls], "listed": False})
+            # Shared stretch -> two lines side by side (person left, cargo
+            # right); single-service and idle edges stay on the track centre.
+            if cls == "mixed":
+                parts = [("person", PARALLEL_OFFSET), ("cargo", -PARALLEL_OFFSET)]
+            elif cls in ("person", "cargo"):
+                parts = [(cls, 0.0)]
+            else:
+                parts = [("none", 0.0)]
+            for part, off in parts:
+                shifted = offset_cells(cells, off)
+                suffix = "" if off == 0 else ("l" if off > 0 else "r")
+                bucket["tracks"].setdefault(part, []).append({
+                    "id": "track-%d%s" % (e["eid"], suffix), "type": "line", "map": mp,
+                    "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + 1.6,
+                                    sum(zs) / len(zs) + 0.5),
+                    "line": [vec(c[0] + 0.5, c[1] + 0.6, c[2] + 0.5) for c in shifted],
+                    "label": "%s: %s \u2192 #%d" % (TRACK_LABEL[cls], e["arm"].upper(), e["dst"]),
+                    "detail": "L\u00e4nge: %d Bl\u00f6cke" % e["len"],
+                    "depthTest": False, "lineWidth": 3,
+                    "lineColor": TRACK_COLOR[part], "listed": False})
 
     for dim, ndim in nodes.items():
         mp = DIM_TO_MAP.get(dim)

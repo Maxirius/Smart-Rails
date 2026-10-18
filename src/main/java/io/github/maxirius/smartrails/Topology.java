@@ -40,12 +40,14 @@ final class Topology {
         final Kind kind;
         final BlockPos pos;
         final String stationName; // only for STATION
+        final boolean cargo;      // only for STATION: freight platform
 
-        Node(String key, Kind kind, BlockPos pos, String stationName) {
+        Node(String key, Kind kind, BlockPos pos, String stationName, boolean cargo) {
             this.key = key;
             this.kind = kind;
             this.pos = pos;
             this.stationName = stationName;
+            this.cargo = cargo;
         }
     }
 
@@ -119,7 +121,8 @@ final class Topology {
         // Seeds: every station anchor and every manual junction.
         List<Object[]> seeds = new ArrayList<>(); // {Node, BlockPos}
         for (Station st : stations) {
-            Node n = node(g, "S|" + st.name.toLowerCase(), Kind.STATION, st.anchor(), st.name);
+            Node n = node(g, "S|" + st.name.toLowerCase(), Kind.STATION, st.anchor(), st.name,
+                    st.cargo);
             seeds.add(new Object[]{n, st.anchor()});
         }
         for (JunctionMarker jm : manuals) {
@@ -509,7 +512,7 @@ final class Topology {
             Station hit = anchors.get(cur);
             if (hit != null) {
                 edge(g, origin, exitDir, exitDy, len, node(g, "S|" + hit.name.toLowerCase(),
-                        Kind.STATION, cur, hit.name), seq);
+                        Kind.STATION, cur, hit.name, hit.cargo), seq);
                 return;
             }
 
@@ -554,11 +557,16 @@ final class Topology {
     }
 
     private static Node node(Graph g, String key, Kind kind, BlockPos pos, String stationName) {
+        return node(g, key, kind, pos, stationName, false);
+    }
+
+    private static Node node(Graph g, String key, Kind kind, BlockPos pos, String stationName,
+                             boolean cargo) {
         Integer idx = g.byKey.get(key);
         if (idx != null) {
             return g.nodes.get(idx);
         }
-        Node n = new Node(key, kind, pos.immutable(), stationName);
+        Node n = new Node(key, kind, pos.immutable(), stationName, cargo);
         g.byKey.put(key, g.nodes.size());
         g.nodes.add(n);
         return n;

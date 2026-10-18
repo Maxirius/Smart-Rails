@@ -109,7 +109,9 @@ public final class DbPublish {
         for (int i = 0; i < g.nodes.size(); i++) {
             Topology.Node n = g.nodes.get(i);
             ns.add(new Object[]{
-                    i + 1, n.kind.name().toLowerCase(),
+                    i + 1,
+                    n.kind == Topology.Kind.STATION && n.cargo
+                            ? "cargo" : n.kind.name().toLowerCase(),
                     n.kind == Topology.Kind.STATION ? n.stationName : null,
                     n.pos.getX(), n.pos.getY(), n.pos.getZ()});
         }

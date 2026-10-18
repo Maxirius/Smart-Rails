@@ -20,7 +20,6 @@ source tables are empty for a map, so a transient DB outage never blanks the
 map.
 """
 
-import heapq
 import json
 import math
 import os
@@ -48,7 +47,7 @@ TRACK_LABEL = {
     "person": "Personenverkehr",
     "cargo": "Warenverkehr",
     "mixed": "gemeinsame Strecke",
-    "none": "ohne Durchgangsverkehr",
+    "none": "ohne Bahnhofsanbindung",
 }
 # Shared stretches are drawn as TWO parallel lines instead of one mixed colour,
 # so both services stay readable on the same physical rails.
@@ -145,80 +144,89 @@ def offset_cells(cells, off):
     return out
 
 
-def classify_traffic(edge_list, station_list, radius=4, dy=3):
-    """Label every edge with the traffic that routes across it.
+def classify_traffic(edge_list, station_list, radius=4, dy=3, hops=40):
+    """Label every edge with the service it belongs to.
 
-    Stations are attached to graph nodes by coordinate proximity (the published
-    `nodes` table and the `edges` endpoints come from different publishes, so
-    their ids are NOT comparable -- coordinates are). For each group of stations
-    (passenger vs. cargo) every shortest station-to-station path is walked and
-    its edges collected. Result: eid -> 'person' | 'cargo' | 'mixed' | 'none'.
+    Every published edge is part of a stretch between two stations, so the label
+    is derived from the two stations the edge's ENDPOINTS lead to: same kind ->
+    'person'/'cargo', different kinds -> 'mixed' (drawn as a double line), and an
+    edge that reaches no station at all -> 'none'.
+
+    Why not shortest station-to-station paths (the first attempt): the network is
+    a ring, so every stretch that only ever lies on the LONG way round never
+    appears in a shortest path and got labelled "no through traffic" -- i.e. grey
+    on perfectly ordinary passenger track. Station kinds are matched by COORDINATE
+    proximity (published `nodes` rows and `edges` endpoints come from different
+    publishes, so their ids are not comparable) and the nearest station is picked
+    by geometric distance, not by hop count.
     """
-    def near(cell, st):
-        return (abs(cell[0] - st["x"]) <= radius
-                and abs(cell[2] - st["z"]) <= radius
-                and abs(cell[1] - st["y"]) <= dy)
-
-    endpoints = {}
+    cells_of = {}
     for e in edge_list:
         if not e["cells"]:
             continue
-        endpoints.setdefault(e["frm"], []).append(e["cells"][0])
-        endpoints.setdefault(e["dst"], []).append(e["cells"][-1])
+        cells_of.setdefault(e["frm"], []).append(e["cells"][0])
+        cells_of.setdefault(e["dst"], []).append(e["cells"][-1])
 
-    linked = {"person": [], "cargo": []}
+    # Attach every station to the graph node it sits on.
+    station_nodes = {}
     for st in station_list:
         best, best_d = None, None
-        for nid, cells in endpoints.items():
+        for nid, cells in cells_of.items():
             for c in cells:
-                if near(c, st):
+                if (abs(c[0] - st["x"]) <= radius and abs(c[2] - st["z"]) <= radius
+                        and abs(c[1] - st["y"]) <= dy):
                     d = abs(c[0] - st["x"]) + abs(c[2] - st["z"])
                     if best_d is None or d < best_d:
                         best, best_d = nid, d
         if best is not None:
             kind = "cargo" if st["kind"] == "cargo" else "person"
-            linked[kind].append(best)
+            station_nodes[best] = (kind, st["x"], st["z"])
 
     adj = {}
     for e in edge_list:
-        adj.setdefault(e["frm"], []).append((e["dst"], e["len"], e["eid"]))
-        adj.setdefault(e["dst"], []).append((e["frm"], e["len"], e["eid"]))
+        adj.setdefault(e["frm"], set()).add(e["dst"])
+        adj.setdefault(e["dst"], set()).add(e["frm"])
 
-    def path_edges(src, dst):
-        dist = {src: 0}
-        prev = {}
-        queue = [(0, src)]
+    nearest = {}
+    for start in adj:
+        seen = {start: 0}
+        queue = [start]
+        candidates = []
         while queue:
-            d, u = heapq.heappop(queue)
-            if d > dist.get(u, 1 << 62):
-                continue
-            for v, w, eid in adj.get(u, ()):
-                nd = d + w
-                if nd < dist.get(v, 1 << 62):
-                    dist[v] = nd
-                    prev[v] = (u, eid)
-                    heapq.heappush(queue, (nd, v))
-        out = set()
-        cur = dst
-        while cur in prev:
-            up, eid = prev[cur]
-            out.add(eid)
-            cur = up
-        return out
-
-    used = {"person": set(), "cargo": set()}
-    for grp, sts in linked.items():
-        for i in range(len(sts)):
-            for j in range(i + 1, len(sts)):
-                used[grp] |= path_edges(sts[i], sts[j])
+            nxt = []
+            for u in queue:
+                if u in station_nodes:
+                    candidates.append(station_nodes[u])
+                if seen[u] >= hops:
+                    continue
+                for v in adj[u]:
+                    if v not in seen:
+                        seen[v] = seen[u] + 1
+                        nxt.append(v)
+            queue = nxt
+        if not candidates:
+            continue
+        here = cells_of[start][0]
+        nearest[start] = min(
+            candidates, key=lambda c: math.hypot(here[0] - c[1], here[2] - c[2]))
 
     labels = {}
     for e in edge_list:
-        p = e["eid"] in used["person"]
-        c = e["eid"] in used["cargo"]
-        labels[e["eid"]] = ("mixed" if p and c else
-                            "person" if p else "cargo" if c else "none")
-    return labels, {k: len(v) for k, v in linked.items()}
+        a = nearest.get(e["frm"])
+        b = nearest.get(e["dst"])
+        ka = a[0] if a else None
+        kb = b[0] if b else None
+        if ka and kb:
+            labels[e["eid"]] = ("mixed" if ka != kb else
+                                "cargo" if ka == "cargo" else "person")
+        elif ka or kb:
+            labels[e["eid"]] = ka or kb
+        else:
+            labels[e["eid"]] = "none"
+    counts = {kind: 0 for kind in ("person", "cargo")}
+    for value in station_nodes.values():
+        counts[value[0]] += 1
+    return labels, counts
 
 
 def main():

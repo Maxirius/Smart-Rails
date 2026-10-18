@@ -1,0 +1,21 @@
+# Build output
+build/
+.gradle/
+out/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+
+# OS / editor noise
+.DS_Store
+*~
+*.swp
+__pycache__/
+*.pyc
+
+# Never commit credentials or local mirrors
+*.env
+libs-local/

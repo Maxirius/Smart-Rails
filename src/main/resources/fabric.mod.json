@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "smartrail",
+  "version": "${version}",
+  "name": "Smart Rails",
+  "description": "Automated rail network control: station signs with destination selector, junction routing, and self-driving minecarts.",
+  "authors": [
+    "Maxirius"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "main": [
+      "io.github.maxirius.smartrails.SmartRails"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "fabric-api": "*",
+    "minecraft": "~26.3",
+    "java": ">=25"
+  }
+}

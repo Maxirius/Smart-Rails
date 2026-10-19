@@ -54,7 +54,6 @@ TRACK_LABEL = {
 # the junctions and drew the same stretch twice). A shared stretch stacks the
 # freight line at the rail and the passenger line just above it.
 RAIL_LIFT = 0.6
-RAIL_STACK = 0.35
 TRACK_COLOR = {
     "person": {"r": 34, "g": 199, "b": 255, "a": 0.95},
     "cargo": {"r": 255, "g": 140, "b": 42, "a": 0.95},
@@ -166,30 +165,41 @@ def build_stretches(edge_list, node_coords=None):
     return out
 
 
-def classify_stretches(stretches, station_list, on_radius=6, on_dy=3,
-                       attach_radius=4, attach_dy=3, hops=40):
-    """Label every stretch with the service it carries.
+def classify_stretches(stretches, station_list, attach_radius=4, attach_dy=3,
+                       hops=40, tie=1.0):
+    """Give every stretch exactly ONE service class: "person" or "cargo".
 
-    A station counts as a reference for a stretch when it lies ON the stretch
-    (same coordinate-proximity rule the mod itself uses to attach a station to
-    the track: the published `nodes` rows and the `edges` endpoints come from
-    different publishes, so their ids are NOT comparable -- coordinates are).
+    There is no third "shared" class any more. When a passenger and a freight
+    station sit a few blocks apart (Cargo2 and Far are 5.7 blocks apart), every
+    stretch in that corner counted as shared and appeared in BOTH marker sets --
+    the same line listed under passenger and under freight traffic. Each stretch
+    now belongs to one set only, decided in this order:
 
-    Only when no station lies on the stretch do we fall back to the nearest
-    station reachable from either end, so an ordinary stretch between two
-    crossings is attributed to the stations it leads to instead of turning into
-    an unattributed grey line (the reason the first shortest-path model produced
-    "no through traffic" on perfectly normal passenger track).
+    1. A station whose own graph node is one of the stretch's ends wins outright:
+       the stub that starts at the freight yard is freight, the one that starts
+       at the passenger platform is passenger.
+    2. Otherwise the nearest station reachable from either end decides (graph
+       walk, geometric distance; the walk keeps ordinary track between two
+       crossings from turning into an unattributed grey line).
+    3. A near-tie (within `tie` blocks) goes to passenger traffic, so track that
+       serves both is drawn as passenger track. Freight orange therefore marks
+       only what is plainly the freight yard's own track.
+
+    Stations are matched by COORDINATE, never by id: the published `nodes` rows
+    and the `edges` endpoints come from different publishes and are not
+    comparable. Distances are 3D, so the station elevated above the boulevard
+    does not win by looking close on a flat map.
     """
-    def d2(a, b):
-        return (a[0] - b[0]) ** 2 + (a[2] - b[2]) ** 2
+    def d3(a, b):
+        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+                         + (a[2] - b[2]) ** 2)
 
-    def on_it(path, x, y, z):
-        return any(abs(c[0] - x) <= on_radius and abs(c[2] - z) <= on_radius
-                   and abs(c[1] - y) <= on_dy for c in path)
+    def kind_of(st):
+        return "cargo" if st["kind"] == "cargo" else "person"
 
-    # Station -> stretch node (by coordinate proximity, per station)
-    attached = {}
+    # Station -> the graph node it sits on (nearest end cell within the mod's own
+    # attach box).
+    own_node = {}
     for st in station_list:
         best, best_d = None, None
         for s in stretches:
@@ -197,30 +207,30 @@ def classify_stretches(stretches, station_list, on_radius=6, on_dy=3,
                 if (abs(cell[0] - st["x"]) <= attach_radius
                         and abs(cell[2] - st["z"]) <= attach_radius
                         and abs(cell[1] - st["y"]) <= attach_dy):
-                    d = abs(cell[0] - st["x"]) + abs(cell[2] - st["z"])
+                    d = math.hypot(cell[0] - st["x"], cell[2] - st["z"])
                     if best_d is None or d < best_d:
                         best, best_d = nid, d
         if best is not None:
-            attached[best] = (st["name"], "cargo" if st["kind"] == "cargo" else "person")
+            own_node.setdefault(best, []).append(st)
 
     adj = {}
+    node_cell = {}
     for s in stretches:
         adj.setdefault(s["frm"], set()).add(s["dst"])
         adj.setdefault(s["dst"], set()).add(s["frm"])
-    node_cell = {}
-    for s in stretches:
         node_cell.setdefault(s["frm"], s["path"][0])
         node_cell.setdefault(s["dst"], s["path"][-1])
 
-    def nearest_station(node):
+    def walk_stations(node):
+        """Every station reachable from `node`, with its distance to that node."""
         seen = {node: 0}
         queue = [node]
-        seen_stations = []
+        found = []
         while queue:
             nxt = []
             for u in queue:
-                if u in attached:
-                    seen_stations.append((u,) + attached[u])
+                for st in own_node.get(u, ()):
+                    found.append((d3(node_cell[node], (st["x"], st["y"], st["z"])), st))
                 if seen[u] >= hops:
                     continue
                 for v in adj.get(u, ()):
@@ -228,35 +238,65 @@ def classify_stretches(stretches, station_list, on_radius=6, on_dy=3,
                         seen[v] = seen[u] + 1
                         nxt.append(v)
             queue = nxt
-        if not seen_stations:
-            return None
-        here = node_cell[node]
-        return min(seen_stations,
-                   key=lambda t: d2(here, node_cell[t[0]]))
+        return found
+
+    def on_path_stations(path):
+        out = []
+        for st in station_list:
+            out.append((min(d3(cell, (st["x"], st["y"], st["z"]))
+                            for cell in path), st))
+        return out
+
+    def closest_ties(candidates):
+        """All candidates within `tie` blocks of the best one.
+
+        Needed because a passenger and a freight station can sit at exactly the
+        same distance from a stretch (Cargo2 and Far are 5.7 blocks apart and
+        both 4.1 blocks off the boulevard). Picking one of them arbitrarily made
+        the whole boulevard freight; the tie has to be resolved as a group, and
+        a tie means passenger traffic (see the docstring).
+        """
+        if not candidates:
+            return []
+        best = min(d for d, _ in candidates)
+        return [(d, st) for d, st in candidates if d <= best + tie]
 
     labels = {}
     served = {}
     for s in stretches:
-        refs = [(st["name"], "cargo" if st["kind"] == "cargo" else "person")
-                for st in station_list
-                if on_it(s["path"], st["x"], st["y"], st["z"])]
-        if not refs:
-            for node in (s["frm"], s["dst"]):
-                near = nearest_station(node)
-                if near:
-                    refs.append((near[1], near[2]))
-        kinds = {kind for _, kind in refs}
-        if not kinds:
-            labels[s["eid"]] = "none"
-        elif len(kinds) > 1:
-            labels[s["eid"]] = "mixed"
+        refs = []
+        for node in (s["frm"], s["dst"]):
+            refs.extend(own_node.get(node, []))
+        if refs:
+            kind = "cargo" if all(kind_of(st) == "cargo" for st in refs) else "person"
         else:
-            labels[s["eid"]] = kinds.pop()
-        served[s["eid"]] = sorted({name for name, _ in refs if name})
+            # Nearest station the stretch leads to, plus the nearest one lying on
+            # it; the closer of the two decides, ties go to passenger traffic.
+            options = []
+            for node in (s["frm"], s["dst"]):
+                options.extend(closest_ties(walk_stations(node)))
+            options.extend(closest_ties(on_path_stations(s["path"])))
+            if not options:
+                kind = "none"
+            else:
+                best = min(d for d, _ in options)
+                tied = [st for d, st in options if d <= best + tie]
+                kind = ("cargo" if all(kind_of(st) == "cargo" for st in tied)
+                        else "person")
+                refs = tied
+        labels[s["eid"]] = kind
+        # Caption: name the stations that MATCH the class (a passenger stretch
+        # next to the freight yard is labelled with the passenger station).
+        names = {st["name"] for st in refs
+                 if st["name"] and (kind == "cargo" or kind_of(st) == "person")}
+        if not names:
+            names = {st["name"] for st in refs if st["name"]}
+        served[s["eid"]] = sorted(names)
 
-    counts = {kind: 0 for kind in ("person", "cargo")}
-    for value in attached.values():
-        counts[value[1]] += 1
+    counts = {k: 0 for k in ("person", "cargo")}
+    for group in own_node.values():
+        for st in group:
+            counts[kind_of(st)] += 1
     return labels, counts, served
 
 
@@ -304,20 +344,15 @@ def main():
             xs = [c[0] for c in cells]
             zs = [c[2] for c in cells]
             ys = [c[1] for c in cells]
-            # One line, exactly on the rails. On a shared stretch the freight
-            # line is drawn at the rail and the passenger line just above it, so
-            # passenger traffic covers freight instead of standing beside it.
-            if cls == "mixed":
-                parts = [("cargo", RAIL_LIFT), ("person", RAIL_LIFT + RAIL_STACK)]
-            else:
-                parts = [(cls, RAIL_LIFT)]
+            # One line per stretch, exactly on the rails. Stacking a second line
+            # on top of the first looked like the freight line was interrupted
+            # halfway, so every stretch carries a single class and a single line.
+            parts = [(cls, RAIL_LIFT)]
             ends = served.get(st["eid"]) or []
             caption = " \u2194 ".join(ends) if ends else ("Weiche %d \u2192 %d" % (st["frm"], st["dst"]))
             for part, lift in parts:
-                suffix = "" if cls != "mixed" else ("r" if part == "cargo" else "l")
-                # On a shared stretch the freight line is the wider underlay, so
-                # the passenger line on top still leaves an orange rim visible.
-                width = 5 if (cls == "mixed" and part == "cargo") else 3
+                suffix = ""
+                width = 3
                 bucket["tracks"].setdefault(part, []).append({
                     "id": "track-%d%s" % (st["eid"], suffix), "type": "line", "map": mp,
                     # BlueMap places a line at the MARKER's height, so stacking

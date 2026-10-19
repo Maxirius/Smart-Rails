@@ -22,6 +22,7 @@ map.
 
 import json
 import math
+import collections
 import os
 import subprocess
 import tempfile
@@ -122,111 +123,186 @@ def atomic_write(path, text):
     os.rename(tmp, path)
 
 
-def offset_cells(cells, off):
+def offset_cells(cells, off, ramp=2):
     """Shift a polyline sideways in the XZ plane by `off` blocks.
 
-    Needed to draw two services that share the same rails as parallel lines.
-    The direction at each vertex is the average of its neighbours, the offset
-    goes along the left-hand perpendicular (miter approximation).
+    Used to draw two services that share the same rails as parallel lines: the
+    direction at each vertex is the average of its neighbours and the offset goes
+    along the left-hand perpendicular (miter approximation).
+
+    The offset is TAPERED TO ZERO at both ends so that the twin lines of a shared
+    stretch converge on the junction node -- otherwise every line ends half a
+    width beside the node and neighbouring stretches look disconnected.
     """
     if off == 0 or len(cells) < 2:
         return [list(c) for c in cells]
+    last = len(cells) - 1
     out = []
     for i, c in enumerate(cells):
         prev = cells[max(0, i - 1)]
-        nxt = cells[min(len(cells) - 1, i + 1)]
+        nxt = cells[min(last, i + 1)]
         dx, dz = nxt[0] - prev[0], nxt[2] - prev[2]
         dist = math.hypot(dx, dz)
         if dist == 0:
             out.append(list(c))
             continue
-        out.append([c[0] + (-dz / dist) * off, c[1], c[2] + (dx / dist) * off])
+        fade = min(1.0, i / float(ramp), (last - i) / float(ramp))
+        out.append([c[0] + (-dz / dist) * off * fade, c[1],
+                    c[2] + (dx / dist) * off * fade])
     return out
 
 
-def classify_traffic(edge_list, station_list, radius=4, dy=3, hops=40):
-    """Label every edge with the service it belongs to.
+def build_stretches(edge_list):
+    """Collapse the per-direction lane edges into PHYSICAL stretches.
 
-    Every published edge is part of a stretch between two stations, so the label
-    is derived from the two stations the edge's ENDPOINTS lead to: same kind ->
-    'person'/'cargo', different kinds -> 'mixed' (drawn as a double line), and an
-    edge that reaches no station at all -> 'none'.
+    Right-hand traffic stores one edge per direction for the same piece of track
+    (15 of them in the reference network). Those lanes are not parallel rails --
+    they overlap cell for cell and differ by about one cell at the ends -- so
+    drawing per edge drew the same line twice, each with its own mirrored
+    perpendicular: passenger and cargo ended up on top of each other and only one
+    colour showed through.
 
-    Why not shortest station-to-station paths (the first attempt): the network is
-    a ring, so every stretch that only ever lies on the LONG way round never
-    appears in a shortest path and got labelled "no through traffic" -- i.e. grey
-    on perfectly ordinary passenger track. Station kinds are matched by COORDINATE
-    proximity (published `nodes` rows and `edges` endpoints come from different
-    publishes, so their ids are not comparable) and the nearest station is picked
-    by geometric distance, not by hop count.
+    Each stretch therefore gets: the union path of its lanes, the most common
+    anchor cell of every node (the lanes disagree by a cell, which left visible
+    gaps at junctions), and a CANONICAL orientation (lower node id first) so the
+    parallel offset lands on the same side no matter which lane is read first.
     """
-    cells_of = {}
+    groups = {}
+    for e in edge_list:
+        if len(e["cells"]) < 2:
+            continue
+        groups.setdefault((min(e["frm"], e["dst"]), max(e["frm"], e["dst"])), []).append(e)
+    if not groups:
+        return []
+
+    counters = {}
     for e in edge_list:
         if not e["cells"]:
             continue
-        cells_of.setdefault(e["frm"], []).append(e["cells"][0])
-        cells_of.setdefault(e["dst"], []).append(e["cells"][-1])
+        counters.setdefault(e["frm"], collections.Counter())[tuple(e["cells"][0])] += 1
+        counters.setdefault(e["dst"], collections.Counter())[tuple(e["cells"][-1])] += 1
+    anchor = {nid: list(c.most_common(1)[0][0]) for nid, c in counters.items()}
 
-    # Attach every station to the graph node it sits on.
-    station_nodes = {}
+    def d2(a, b):
+        return (a[0] - b[0]) ** 2 + (a[2] - b[2]) ** 2
+
+    out = []
+    for (a, b), lanes in sorted(groups.items()):
+        path = [list(c) for c in max((l["cells"] for l in lanes), key=len)]
+        for lane in lanes:
+            for c in lane["cells"]:
+                if [c[0], c[1], c[2]] in path:
+                    continue
+                if d2(c, path[-1]) <= d2(c, path[0]):
+                    path.append([c[0], c[1], c[2]])
+                else:
+                    path.insert(0, [c[0], c[1], c[2]])
+        if a in anchor and b in anchor and d2(path[0], anchor[a]) > d2(path[0], anchor[b]):
+            path.reverse()
+            first, last = b, a
+        else:
+            first, last = a, b
+        path[0] = list(anchor[first])
+        path[-1] = list(anchor[last])
+        lead = min(lanes, key=lambda l: l["eid"])
+        out.append({"eid": lead["eid"], "frm": first, "dst": last, "path": path,
+                    "lanes": len(lanes), "len": max(l["len"] for l in lanes),
+                    "arm": lead["arm"]})
+    return out
+
+
+def classify_stretches(stretches, station_list, on_radius=6, on_dy=3,
+                       attach_radius=4, attach_dy=3, hops=40):
+    """Label every stretch with the service it carries.
+
+    A station counts as a reference for a stretch when it lies ON the stretch
+    (same coordinate-proximity rule the mod itself uses to attach a station to
+    the track: the published `nodes` rows and the `edges` endpoints come from
+    different publishes, so their ids are NOT comparable -- coordinates are).
+
+    Only when no station lies on the stretch do we fall back to the nearest
+    station reachable from either end, so an ordinary stretch between two
+    crossings is attributed to the stations it leads to instead of turning into
+    an unattributed grey line (the reason the first shortest-path model produced
+    "no through traffic" on perfectly normal passenger track).
+    """
+    def d2(a, b):
+        return (a[0] - b[0]) ** 2 + (a[2] - b[2]) ** 2
+
+    def on_it(path, x, y, z):
+        return any(abs(c[0] - x) <= on_radius and abs(c[2] - z) <= on_radius
+                   and abs(c[1] - y) <= on_dy for c in path)
+
+    # Station -> stretch node (by coordinate proximity, per station)
+    attached = {}
     for st in station_list:
         best, best_d = None, None
-        for nid, cells in cells_of.items():
-            for c in cells:
-                if (abs(c[0] - st["x"]) <= radius and abs(c[2] - st["z"]) <= radius
-                        and abs(c[1] - st["y"]) <= dy):
-                    d = abs(c[0] - st["x"]) + abs(c[2] - st["z"])
+        for s in stretches:
+            for nid, cell in ((s["frm"], s["path"][0]), (s["dst"], s["path"][-1])):
+                if (abs(cell[0] - st["x"]) <= attach_radius
+                        and abs(cell[2] - st["z"]) <= attach_radius
+                        and abs(cell[1] - st["y"]) <= attach_dy):
+                    d = abs(cell[0] - st["x"]) + abs(cell[2] - st["z"])
                     if best_d is None or d < best_d:
                         best, best_d = nid, d
         if best is not None:
-            kind = "cargo" if st["kind"] == "cargo" else "person"
-            station_nodes[best] = (kind, st["x"], st["z"])
+            attached[best] = (st["name"], "cargo" if st["kind"] == "cargo" else "person")
 
     adj = {}
-    for e in edge_list:
-        adj.setdefault(e["frm"], set()).add(e["dst"])
-        adj.setdefault(e["dst"], set()).add(e["frm"])
+    for s in stretches:
+        adj.setdefault(s["frm"], set()).add(s["dst"])
+        adj.setdefault(s["dst"], set()).add(s["frm"])
+    node_cell = {}
+    for s in stretches:
+        node_cell.setdefault(s["frm"], s["path"][0])
+        node_cell.setdefault(s["dst"], s["path"][-1])
 
-    nearest = {}
-    for start in adj:
-        seen = {start: 0}
-        queue = [start]
-        candidates = []
+    def nearest_station(node):
+        seen = {node: 0}
+        queue = [node]
+        seen_stations = []
         while queue:
             nxt = []
             for u in queue:
-                if u in station_nodes:
-                    candidates.append(station_nodes[u])
+                if u in attached:
+                    seen_stations.append((u,) + attached[u])
                 if seen[u] >= hops:
                     continue
-                for v in adj[u]:
+                for v in adj.get(u, ()):
                     if v not in seen:
                         seen[v] = seen[u] + 1
                         nxt.append(v)
             queue = nxt
-        if not candidates:
-            continue
-        here = cells_of[start][0]
-        nearest[start] = min(
-            candidates, key=lambda c: math.hypot(here[0] - c[1], here[2] - c[2]))
+        if not seen_stations:
+            return None
+        here = node_cell[node]
+        return min(seen_stations,
+                   key=lambda t: d2(here, node_cell[t[0]]))
 
     labels = {}
-    for e in edge_list:
-        a = nearest.get(e["frm"])
-        b = nearest.get(e["dst"])
-        ka = a[0] if a else None
-        kb = b[0] if b else None
-        if ka and kb:
-            labels[e["eid"]] = ("mixed" if ka != kb else
-                                "cargo" if ka == "cargo" else "person")
-        elif ka or kb:
-            labels[e["eid"]] = ka or kb
+    served = {}
+    for s in stretches:
+        refs = [(st["name"], "cargo" if st["kind"] == "cargo" else "person")
+                for st in station_list
+                if on_it(s["path"], st["x"], st["y"], st["z"])]
+        if not refs:
+            for node in (s["frm"], s["dst"]):
+                near = nearest_station(node)
+                if near:
+                    refs.append((near[1], near[2]))
+        kinds = {kind for _, kind in refs}
+        if not kinds:
+            labels[s["eid"]] = "none"
+        elif len(kinds) > 1:
+            labels[s["eid"]] = "mixed"
         else:
-            labels[e["eid"]] = "none"
+            labels[s["eid"]] = kinds.pop()
+        served[s["eid"]] = sorted({name for name, _ in refs if name})
+
     counts = {kind: 0 for kind in ("person", "cargo")}
-    for value in station_nodes.values():
-        counts[value[0]] += 1
-    return labels, counts
+    for value in attached.values():
+        counts[value[1]] += 1
+    return labels, counts, served
 
 
 def main():
@@ -260,35 +336,40 @@ def main():
         if not mp:
             continue
         bucket = per_map.setdefault(mp, {"tracks": {}, "stations": []})
-        labels, _ = classify_traffic(
-            edim, [n for n in nodes.get(dim, [])
-                   if n["kind"] in ("station", "cargo")])
-        for e in edim:
-            cells = e["cells"]
+        stretches = build_stretches(edim)
+        labels, _, served = classify_stretches(
+            stretches, [n for n in nodes.get(dim, [])
+                        if n["kind"] in ("station", "cargo")])
+        for st in stretches:
+            cells = st["path"]
             if len(cells) < 2:
                 continue
-            cls = labels.get(e["eid"], "none")
+            cls = labels.get(st["eid"], "none")
             xs = [c[0] for c in cells]
             zs = [c[2] for c in cells]
             ys = [c[1] for c in cells]
             # Shared stretch -> two lines side by side (person left, cargo
-            # right); single-service and idle edges stay on the track centre.
+            # right); single-service and idle stretches stay on the centre.
             if cls == "mixed":
                 parts = [("person", PARALLEL_OFFSET), ("cargo", -PARALLEL_OFFSET)]
             elif cls in ("person", "cargo"):
                 parts = [(cls, 0.0)]
             else:
                 parts = [("none", 0.0)]
+            ends = served.get(st["eid"]) or []
+            caption = " \u2194 ".join(ends) if ends else ("Weiche %d \u2192 %d" % (st["frm"], st["dst"]))
             for part, off in parts:
                 shifted = offset_cells(cells, off)
                 suffix = "" if off == 0 else ("l" if off > 0 else "r")
                 bucket["tracks"].setdefault(part, []).append({
-                    "id": "track-%d%s" % (e["eid"], suffix), "type": "line", "map": mp,
+                    "id": "track-%d%s" % (st["eid"], suffix), "type": "line", "map": mp,
                     "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + 1.6,
                                     sum(zs) / len(zs) + 0.5),
                     "line": [vec(c[0] + 0.5, c[1] + 0.6, c[2] + 0.5) for c in shifted],
-                    "label": "%s: %s \u2192 #%d" % (TRACK_LABEL[cls], e["arm"].upper(), e["dst"]),
-                    "detail": "L\u00e4nge: %d Bl\u00f6cke" % e["len"],
+                    "label": "%s: %s" % (TRACK_LABEL[cls], caption),
+                    "detail": ("L\u00e4nge: %d Bl\u00f6cke%s"
+                               % (st["len"], "" if st["lanes"] < 2
+                                  else " \u00b7 %d Fahrspuren" % st["lanes"])),
                     "depthTest": False, "lineWidth": 3,
                     "lineColor": TRACK_COLOR[part], "listed": False})
 
@@ -354,9 +435,10 @@ def main():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        traffic = classify_traffic(
-            edges.get(dim, []),
-            [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")])[0]
+        stretches = build_stretches(edges.get(dim, []))
+        traffic, _, _ = classify_stretches(
+            stretches,
+            [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")])
         feed["dims"][mp] = {
             "stations": [
                 {"name": n["name"], "type": n["kind"],
@@ -364,9 +446,9 @@ def main():
                 for n in nodes.get(dim, [])
                 if n["kind"] in ("station", "cargo")],
             "tracks": [
-                {"len": e["len"], "cells": e["cells"],
-                 "traffic": traffic.get(e["eid"], "none")}
-                for e in edges.get(dim, [])]}
+                {"len": s["len"], "cells": s["path"],
+                 "traffic": traffic.get(s["eid"], "none")}
+                for s in stretches]}
     atomic_write(os.path.join(SITE_DIR, "network.json"),
                  json.dumps(feed, separators=(",", ":")))
 

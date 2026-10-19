@@ -197,13 +197,16 @@ def build_stretches(edge_list):
                     path.append([c[0], c[1], c[2]])
                 else:
                     path.insert(0, [c[0], c[1], c[2]])
-        if a in anchor and b in anchor and d2(path[0], anchor[a]) > d2(path[0], anchor[b]):
+        # Canonical orientation: path[0] must sit at the LOWER node id, so the
+        # perpendicular (and with it the side of the parallel offset) is stable.
+        # Reverse when the stored order starts at the other end -- and do NOT
+        # swap the node labels afterwards: that mismatch snapped path[0] to the
+        # opposite junction and drew a line straight across the map.
+        if a in anchor and d2(path[0], anchor[a]) > d2(path[0], anchor.get(b, path[-1])):
             path.reverse()
-            first, last = b, a
-        else:
-            first, last = a, b
-        path[0] = list(anchor[first])
-        path[-1] = list(anchor[last])
+        first, last = a, b
+        path[0] = list(anchor.get(a, path[0]))
+        path[-1] = list(anchor.get(b, path[-1]))
         lead = min(lanes, key=lambda l: l["eid"])
         out.append({"eid": lead["eid"], "frm": first, "dst": last, "path": path,
                     "lanes": len(lanes), "len": max(l["len"] for l in lanes),

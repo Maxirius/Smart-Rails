@@ -43,23 +43,15 @@ DIM_TO_MAP = {
 # The rails are ONE physical network shared by both traffic kinds, so an edge is
 # labelled by the stations that route across it (shortest paths within each
 # station group): passenger-only, cargo-only, shared, or on no route at all.
-TRAFFIC = ("person", "cargo", "none")
-TRACK_LABEL = {
-    "person": "Personenverkehr",
-    "cargo": "Warenverkehr",
-    "mixed": "gemeinsame Strecke",
-    "none": "ohne Bahnhofsanbindung",
-}
-# Every line sits exactly on the rails (no lateral offset: parallel lines broke
-# the junctions and drew the same stretch twice). A shared stretch stacks the
-# freight line at the rail and the passenger line just above it.
+# ONE colour for the whole network. The passenger/freight split never settled:
+# most track carries both, so colouring it either way hid one of the two services
+# (the freight line "disappeared" wherever passenger traffic ran). The service of
+# a place is now told by the STATION markers -- yellow = passenger, pink =
+# freight -- and the rails themselves are just the network.
+TRACK_COLOR = {"r": 34, "g": 199, "b": 255, "a": 1}
+TRACK_LABEL = "Gleisnetz"
+# How far above the track block the line is drawn.
 RAIL_LIFT = 0.6
-TRACK_COLOR = {
-    "person": {"r": 34, "g": 199, "b": 255, "a": 0.95},
-    "cargo": {"r": 255, "g": 140, "b": 42, "a": 0.95},
-    "mixed": {"r": 179, "g": 136, "b": 255, "a": 0.9},
-    "none": {"r": 120, "g": 131, "b": 143, "a": 0.8},
-}
 STATION_COLOR = {"station": "#ffd54a", "cargo": "#ff5c8a"}
 
 
@@ -165,139 +157,22 @@ def build_stretches(edge_list, node_coords=None):
     return out
 
 
-def classify_stretches(stretches, station_list, attach_radius=4, attach_dy=3,
-                       hops=40, tie=1.0):
-    """Give every stretch exactly ONE service class: "person" or "cargo".
+def stations_on_path(path, station_list, radius=6, dy=4):
+    """Names of the stations that sit on (or right by) a stretch.
 
-    There is no third "shared" class any more. When a passenger and a freight
-    station sit a few blocks apart (Cargo2 and Far are 5.7 blocks apart), every
-    stretch in that corner counted as shared and appeared in BOTH marker sets --
-    the same line listed under passenger and under freight traffic. Each stretch
-    now belongs to one set only, decided in this order:
-
-    1. A station whose own graph node is one of the stretch's ends wins outright:
-       the stub that starts at the freight yard is freight, the one that starts
-       at the passenger platform is passenger.
-    2. Otherwise the nearest station reachable from either end decides (graph
-       walk, geometric distance; the walk keeps ordinary track between two
-       crossings from turning into an unattributed grey line).
-    3. A near-tie (within `tie` blocks) goes to passenger traffic, so track that
-       serves both is drawn as passenger track. Freight orange therefore marks
-       only what is plainly the freight yard's own track.
-
-    Stations are matched by COORDINATE, never by id: the published `nodes` rows
-    and the `edges` endpoints come from different publishes and are not
-    comparable. Distances are 3D, so the station elevated above the boulevard
-    does not win by looking close on a flat map.
+    Only used for the hover label -- there is no passenger/freight class any
+    more. A stretch that leads past no station simply says so; it is still drawn,
+    because it IS track in the database (junctions and connection pieces between
+    stations belong to the network even when no station is on them).
     """
-    def d3(a, b):
-        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
-                         + (a[2] - b[2]) ** 2)
-
-    def kind_of(st):
-        return "cargo" if st["kind"] == "cargo" else "person"
-
-    # Station -> the graph node it sits on (nearest end cell within the mod's own
-    # attach box).
-    own_node = {}
+    out = []
     for st in station_list:
-        best, best_d = None, None
-        for s in stretches:
-            for nid, cell in ((s["frm"], s["path"][0]), (s["dst"], s["path"][-1])):
-                if (abs(cell[0] - st["x"]) <= attach_radius
-                        and abs(cell[2] - st["z"]) <= attach_radius
-                        and abs(cell[1] - st["y"]) <= attach_dy):
-                    d = math.hypot(cell[0] - st["x"], cell[2] - st["z"])
-                    if best_d is None or d < best_d:
-                        best, best_d = nid, d
-        if best is not None:
-            own_node.setdefault(best, []).append(st)
-
-    adj = {}
-    node_cell = {}
-    for s in stretches:
-        adj.setdefault(s["frm"], set()).add(s["dst"])
-        adj.setdefault(s["dst"], set()).add(s["frm"])
-        node_cell.setdefault(s["frm"], s["path"][0])
-        node_cell.setdefault(s["dst"], s["path"][-1])
-
-    def walk_stations(node):
-        """Every station reachable from `node`, with its distance to that node."""
-        seen = {node: 0}
-        queue = [node]
-        found = []
-        while queue:
-            nxt = []
-            for u in queue:
-                for st in own_node.get(u, ()):
-                    found.append((d3(node_cell[node], (st["x"], st["y"], st["z"])), st))
-                if seen[u] >= hops:
-                    continue
-                for v in adj.get(u, ()):
-                    if v not in seen:
-                        seen[v] = seen[u] + 1
-                        nxt.append(v)
-            queue = nxt
-        return found
-
-    def on_path_stations(path):
-        out = []
-        for st in station_list:
-            out.append((min(d3(cell, (st["x"], st["y"], st["z"]))
-                            for cell in path), st))
-        return out
-
-    def closest_ties(candidates):
-        """All candidates within `tie` blocks of the best one.
-
-        Needed because a passenger and a freight station can sit at exactly the
-        same distance from a stretch (Cargo2 and Far are 5.7 blocks apart and
-        both 4.1 blocks off the boulevard). Picking one of them arbitrarily made
-        the whole boulevard freight; the tie has to be resolved as a group, and
-        a tie means passenger traffic (see the docstring).
-        """
-        if not candidates:
-            return []
-        best = min(d for d, _ in candidates)
-        return [(d, st) for d, st in candidates if d <= best + tie]
-
-    labels = {}
-    served = {}
-    for s in stretches:
-        refs = []
-        for node in (s["frm"], s["dst"]):
-            refs.extend(own_node.get(node, []))
-        if refs:
-            kind = "cargo" if all(kind_of(st) == "cargo" for st in refs) else "person"
-        else:
-            # Nearest station the stretch leads to, plus the nearest one lying on
-            # it; the closer of the two decides, ties go to passenger traffic.
-            options = []
-            for node in (s["frm"], s["dst"]):
-                options.extend(closest_ties(walk_stations(node)))
-            options.extend(closest_ties(on_path_stations(s["path"])))
-            if not options:
-                kind = "none"
-            else:
-                best = min(d for d, _ in options)
-                tied = [st for d, st in options if d <= best + tie]
-                kind = ("cargo" if all(kind_of(st) == "cargo" for st in tied)
-                        else "person")
-                refs = tied
-        labels[s["eid"]] = kind
-        # Caption: name the stations that MATCH the class (a passenger stretch
-        # next to the freight yard is labelled with the passenger station).
-        names = {st["name"] for st in refs
-                 if st["name"] and (kind == "cargo" or kind_of(st) == "person")}
-        if not names:
-            names = {st["name"] for st in refs if st["name"]}
-        served[s["eid"]] = sorted(names)
-
-    counts = {k: 0 for k in ("person", "cargo")}
-    for group in own_node.values():
-        for st in group:
-            counts[kind_of(st)] += 1
-    return labels, counts, served
+        for cell in path:
+            if (abs(cell[0] - st["x"]) <= radius and abs(cell[2] - st["z"]) <= radius
+                    and abs(cell[1] - st["y"]) <= dy):
+                out.append(st["name"] or "?")
+                break
+    return sorted(set(out))
 
 
 def main():
@@ -330,48 +205,36 @@ def main():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        bucket = per_map.setdefault(mp, {"tracks": {}, "stations": []})
+        bucket = per_map.setdefault(mp, {"tracks": [], "stations": []})
         coords = {n["nid"]: (n["x"], n["y"], n["z"]) for n in nodes.get(dim, [])}
         stretches = build_stretches(edim, coords)
-        labels, _, served = classify_stretches(
-            stretches, [n for n in nodes.get(dim, [])
-                        if n["kind"] in ("station", "cargo")])
+        stands = [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")]
         for st in stretches:
             cells = st["path"]
             if len(cells) < 2:
                 continue
-            cls = labels.get(st["eid"], "none")
             xs = [c[0] for c in cells]
-            zs = [c[2] for c in cells]
             ys = [c[1] for c in cells]
-            # One line per stretch, exactly on the rails. Stacking a second line
-            # on top of the first looked like the freight line was interrupted
-            # halfway, so every stretch carries a single class and a single line.
-            parts = [(cls, RAIL_LIFT)]
-            ends = served.get(st["eid"]) or []
-            caption = " \u2194 ".join(ends) if ends else ("Weiche %d \u2192 %d" % (st["frm"], st["dst"]))
-            for part, lift in parts:
-                suffix = ""
-                width = 3
-                bucket["tracks"].setdefault(part, []).append({
-                    "id": "track-%d%s" % (st["eid"], suffix), "type": "line", "map": mp,
-                    # BlueMap places a line at the MARKER's height, so stacking
-                    # (freight underlay, passenger on top) has to happen here.
-                    "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + lift,
-                                    sum(zs) / len(zs) + 0.5),
-                    "line": [vec(c[0] + 0.5, c[1] + lift, c[2] + 0.5) for c in cells],
-                    "label": "%s: %s" % (TRACK_LABEL[cls], caption),
-                    "detail": ("L\u00e4nge: %d Bl\u00f6cke%s"
-                               % (st["len"], "" if st["lanes"] < 2
-                                  else " \u00b7 %d Fahrspuren" % st["lanes"])),
-                    "depthTest": False, "lineWidth": width,
-                    "lineColor": TRACK_COLOR[part], "listed": False})
+            zs = [c[2] for c in cells]
+            on = stations_on_path(cells, stands)
+            caption = " \u2194 ".join(on) if on else "kein Bahnhof an der Strecke"
+            bucket["tracks"].append({
+                "id": "track-%d" % st["eid"], "type": "line", "map": mp,
+                "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + RAIL_LIFT,
+                                sum(zs) / len(zs) + 0.5),
+                "line": [vec(c[0] + 0.5, c[1] + RAIL_LIFT, c[2] + 0.5) for c in cells],
+                "label": "Gleis: %s" % caption,
+                "detail": "L\u00e4nge: %d Bl\u00f6cke%s"
+                          % (st["len"], "" if st["lanes"] < 2
+                             else " \u00b7 %d Fahrspuren" % st["lanes"]),
+                "depthTest": False, "lineWidth": 3,
+                "lineColor": TRACK_COLOR, "listed": False})
 
     for dim, ndim in nodes.items():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        bucket = per_map.setdefault(mp, {"tracks": {}, "stations": []})
+        bucket = per_map.setdefault(mp, {"tracks": [], "stations": []})
         for n in ndim:
             if n["kind"] not in ("station", "cargo"):
                 continue
@@ -404,15 +267,11 @@ def main():
                     for m in markers}
 
         payload = {}
-        for sorting, cls in enumerate(TRAFFIC):
-            markers = bucket["tracks"].get(cls) or []
-            if not markers:          # keep the menu clean: only non-empty sets
-                continue
-            sid = "smartrail-track-" + cls
-            payload[sid] = {
-                "id": sid, "label": "Smart Rails \u00b7 Gleise: " + TRACK_LABEL[cls],
-                "toggleable": True, "defaultHidden": False,
-                "sorting": 10 + sorting, "markers": by_id(markers)}
+        if bucket["tracks"]:
+            payload["smartrail-tracks"] = {
+                "id": "smartrail-tracks", "label": "Smart Rails \u00b7 Gleisnetz",
+                "toggleable": True, "defaultHidden": False, "sorting": 10,
+                "markers": by_id(bucket["tracks"])}
         payload["smartrail-stations"] = {
             "id": "smartrail-stations", "label": "Smart Rails \u00b7 Stationen",
             "toggleable": True, "defaultHidden": False, "sorting": 20,
@@ -420,8 +279,7 @@ def main():
         atomic_write(os.path.join(MAP_APP_DIR, "maps", mp, "live", "markers.json"),
                      json.dumps(payload, separators=(",", ":")))
         written_maps.append("%s(%d/%d)" % (
-            mp, sum(len(v) for v in bucket["tracks"].values()),
-            len(bucket["stations"])))
+            mp, len(bucket["tracks"]), len(bucket["stations"])))
 
     # -------- Slim site feed --------
     feed = {"generatedUtc": stamp, "dims": {}}
@@ -431,24 +289,20 @@ def main():
             continue
         coords = {n["nid"]: (n["x"], n["y"], n["z"]) for n in nodes.get(dim, [])}
         stretches = build_stretches(edges.get(dim, []), coords)
-        traffic, _, _ = classify_stretches(
-            stretches,
-            [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")])
+        stands = [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")]
         feed["dims"][mp] = {
             "stations": [
                 {"name": n["name"], "type": n["kind"],
                  "x": n["x"], "y": n["y"], "z": n["z"]}
-                for n in nodes.get(dim, [])
-                if n["kind"] in ("station", "cargo")],
+                for n in stands],
             "tracks": [
                 {"len": s["len"], "cells": s["path"],
-                 "traffic": traffic.get(s["eid"], "none")}
+                 "stations": stations_on_path(s["path"], stands)}
                 for s in stretches]}
     atomic_write(os.path.join(SITE_DIR, "network.json"),
                  json.dumps(feed, separators=(",", ":")))
 
-    total_tracks = sum(len(v) for b in per_map.values()
-                       for v in b["tracks"].values())
+    total_tracks = sum(len(b["tracks"]) for b in per_map.values())
     total_stations = sum(len(b["stations"]) for b in per_map.values())
     print("feed ok utc=%d maps=%s total_tracks=%d total_stations=%d" % (
         stamp, ",".join(written_maps) or "-", total_tracks, total_stations))

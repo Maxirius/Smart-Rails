@@ -50,9 +50,11 @@ TRACK_LABEL = {
     "mixed": "gemeinsame Strecke",
     "none": "ohne Bahnhofsanbindung",
 }
-# Shared stretches are drawn as TWO parallel lines instead of one mixed colour,
-# so both services stay readable on the same physical rails.
-PARALLEL_OFFSET = 0.6
+# Every line sits exactly on the rails (no lateral offset: parallel lines broke
+# the junctions and drew the same stretch twice). A shared stretch stacks the
+# freight line at the rail and the passenger line just above it.
+RAIL_LIFT = 0.6
+RAIL_STACK = 0.35
 TRACK_COLOR = {
     "person": {"r": 34, "g": 199, "b": 255, "a": 0.95},
     "cargo": {"r": 255, "g": 140, "b": 42, "a": 0.95},
@@ -123,94 +125,44 @@ def atomic_write(path, text):
     os.rename(tmp, path)
 
 
-def offset_cells(cells, off, ramp=2):
-    """Shift a polyline sideways in the XZ plane by `off` blocks.
-
-    Used to draw two services that share the same rails as parallel lines: the
-    direction at each vertex is the average of its neighbours and the offset goes
-    along the left-hand perpendicular (miter approximation).
-
-    The offset is TAPERED TO ZERO at both ends so that the twin lines of a shared
-    stretch converge on the junction node -- otherwise every line ends half a
-    width beside the node and neighbouring stretches look disconnected.
-    """
-    if off == 0 or len(cells) < 2:
-        return [list(c) for c in cells]
-    last = len(cells) - 1
-    out = []
-    for i, c in enumerate(cells):
-        prev = cells[max(0, i - 1)]
-        nxt = cells[min(last, i + 1)]
-        dx, dz = nxt[0] - prev[0], nxt[2] - prev[2]
-        dist = math.hypot(dx, dz)
-        if dist == 0:
-            out.append(list(c))
-            continue
-        fade = min(1.0, i / float(ramp), (last - i) / float(ramp))
-        out.append([c[0] + (-dz / dist) * off * fade, c[1],
-                    c[2] + (dx / dist) * off * fade])
-    return out
-
-
-def build_stretches(edge_list):
-    """Collapse the per-direction lane edges into PHYSICAL stretches.
+def build_stretches(edge_list, node_coords=None):
+    """Collapse the per-direction lane edges into one PHYSICAL stretch.
 
     Right-hand traffic stores one edge per direction for the same piece of track
-    (15 of them in the reference network). Those lanes are not parallel rails --
-    they overlap cell for cell and differ by about one cell at the ends -- so
-    drawing per edge drew the same line twice, each with its own mirrored
-    perpendicular: passenger and cargo ended up on top of each other and only one
-    colour showed through.
-
-    Each stretch therefore gets: the union path of its lanes, the most common
-    anchor cell of every node (the lanes disagree by a cell, which left visible
-    gaps at junctions), and a CANONICAL orientation (lower node id first) so the
-    parallel offset lands on the same side no matter which lane is read first.
+    (14 of them in the reference network) and those lanes are not parallel rails:
+    they overlap cell for cell and differ by about one cell at the ends. The
+    stretch therefore keeps the geometry of its LONGEST lane verbatim -- the line
+    sits exactly on the rails, no lateral offset -- and snaps only its two end
+    cells onto the junction anchor (the anchor cell most edges agree on), so
+    neighbouring stretches meet exactly at the crossing.
     """
     groups = {}
     for e in edge_list:
-        if len(e["cells"]) < 2:
-            continue
-        groups.setdefault((min(e["frm"], e["dst"]), max(e["frm"], e["dst"])), []).append(e)
+        if len(e["cells"]) >= 2:
+            groups.setdefault((min(e["frm"], e["dst"]), max(e["frm"], e["dst"])), []).append(e)
     if not groups:
         return []
 
-    counters = {}
-    for e in edge_list:
-        if not e["cells"]:
-            continue
-        counters.setdefault(e["frm"], collections.Counter())[tuple(e["cells"][0])] += 1
-        counters.setdefault(e["dst"], collections.Counter())[tuple(e["cells"][-1])] += 1
-    anchor = {nid: list(c.most_common(1)[0][0]) for nid, c in counters.items()}
-
-    def d2(a, b):
-        return (a[0] - b[0]) ** 2 + (a[2] - b[2]) ** 2
+    if node_coords is None:
+        counters = {}
+        for e in edge_list:
+            if not e["cells"]:
+                continue
+            counters.setdefault(e["frm"], collections.Counter())[tuple(e["cells"][0])] += 1
+            counters.setdefault(e["dst"], collections.Counter())[tuple(e["cells"][-1])] += 1
+        node_coords = {nid: list(c.most_common(1)[0][0]) for nid, c in counters.items()}
+    else:
+        node_coords = {nid: list(c) for nid, c in node_coords.items()}
 
     out = []
-    for (a, b), lanes in sorted(groups.items()):
-        path = [list(c) for c in max((l["cells"] for l in lanes), key=len)]
-        for lane in lanes:
-            for c in lane["cells"]:
-                if [c[0], c[1], c[2]] in path:
-                    continue
-                if d2(c, path[-1]) <= d2(c, path[0]):
-                    path.append([c[0], c[1], c[2]])
-                else:
-                    path.insert(0, [c[0], c[1], c[2]])
-        # Canonical orientation: path[0] must sit at the LOWER node id, so the
-        # perpendicular (and with it the side of the parallel offset) is stable.
-        # Reverse when the stored order starts at the other end -- and do NOT
-        # swap the node labels afterwards: that mismatch snapped path[0] to the
-        # opposite junction and drew a line straight across the map.
-        if a in anchor and d2(path[0], anchor[a]) > d2(path[0], anchor.get(b, path[-1])):
-            path.reverse()
-        first, last = a, b
-        path[0] = list(anchor.get(a, path[0]))
-        path[-1] = list(anchor.get(b, path[-1]))
-        lead = min(lanes, key=lambda l: l["eid"])
-        out.append({"eid": lead["eid"], "frm": first, "dst": last, "path": path,
-                    "lanes": len(lanes), "len": max(l["len"] for l in lanes),
-                    "arm": lead["arm"]})
+    for _, lanes in sorted(groups.items()):
+        base = min(lanes, key=lambda l: (-len(l["cells"]), l["eid"]))
+        path = [list(c) for c in base["cells"]]
+        path[0] = list(node_coords.get(base["frm"], path[0]))
+        path[-1] = list(node_coords.get(base["dst"], path[-1]))
+        out.append({"eid": base["eid"], "frm": base["frm"], "dst": base["dst"],
+                    "path": path, "lanes": len(lanes),
+                    "len": max(l["len"] for l in lanes), "arm": base["arm"]})
     return out
 
 
@@ -339,7 +291,8 @@ def main():
         if not mp:
             continue
         bucket = per_map.setdefault(mp, {"tracks": {}, "stations": []})
-        stretches = build_stretches(edim)
+        coords = {n["nid"]: (n["x"], n["y"], n["z"]) for n in nodes.get(dim, [])}
+        stretches = build_stretches(edim, coords)
         labels, _, served = classify_stretches(
             stretches, [n for n in nodes.get(dim, [])
                         if n["kind"] in ("station", "cargo")])
@@ -351,29 +304,32 @@ def main():
             xs = [c[0] for c in cells]
             zs = [c[2] for c in cells]
             ys = [c[1] for c in cells]
-            # Shared stretch -> two lines side by side (person left, cargo
-            # right); single-service and idle stretches stay on the centre.
+            # One line, exactly on the rails. On a shared stretch the freight
+            # line is drawn at the rail and the passenger line just above it, so
+            # passenger traffic covers freight instead of standing beside it.
             if cls == "mixed":
-                parts = [("person", PARALLEL_OFFSET), ("cargo", -PARALLEL_OFFSET)]
-            elif cls in ("person", "cargo"):
-                parts = [(cls, 0.0)]
+                parts = [("cargo", RAIL_LIFT), ("person", RAIL_LIFT + RAIL_STACK)]
             else:
-                parts = [("none", 0.0)]
+                parts = [(cls, RAIL_LIFT)]
             ends = served.get(st["eid"]) or []
             caption = " \u2194 ".join(ends) if ends else ("Weiche %d \u2192 %d" % (st["frm"], st["dst"]))
-            for part, off in parts:
-                shifted = offset_cells(cells, off)
-                suffix = "" if off == 0 else ("l" if off > 0 else "r")
+            for part, lift in parts:
+                suffix = "" if cls != "mixed" else ("r" if part == "cargo" else "l")
+                # On a shared stretch the freight line is the wider underlay, so
+                # the passenger line on top still leaves an orange rim visible.
+                width = 5 if (cls == "mixed" and part == "cargo") else 3
                 bucket["tracks"].setdefault(part, []).append({
                     "id": "track-%d%s" % (st["eid"], suffix), "type": "line", "map": mp,
-                    "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + 1.6,
+                    # BlueMap places a line at the MARKER's height, so stacking
+                    # (freight underlay, passenger on top) has to happen here.
+                    "position": vec(sum(xs) / len(xs) + 0.5, min(ys) + lift,
                                     sum(zs) / len(zs) + 0.5),
-                    "line": [vec(c[0] + 0.5, c[1] + 0.6, c[2] + 0.5) for c in shifted],
+                    "line": [vec(c[0] + 0.5, c[1] + lift, c[2] + 0.5) for c in cells],
                     "label": "%s: %s" % (TRACK_LABEL[cls], caption),
                     "detail": ("L\u00e4nge: %d Bl\u00f6cke%s"
                                % (st["len"], "" if st["lanes"] < 2
                                   else " \u00b7 %d Fahrspuren" % st["lanes"])),
-                    "depthTest": False, "lineWidth": 3,
+                    "depthTest": False, "lineWidth": width,
                     "lineColor": TRACK_COLOR[part], "listed": False})
 
     for dim, ndim in nodes.items():
@@ -438,7 +394,8 @@ def main():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        stretches = build_stretches(edges.get(dim, []))
+        coords = {n["nid"]: (n["x"], n["y"], n["z"]) for n in nodes.get(dim, [])}
+        stretches = build_stretches(edges.get(dim, []), coords)
         traffic, _, _ = classify_stretches(
             stretches,
             [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")])

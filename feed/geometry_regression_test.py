@@ -67,6 +67,25 @@ print("diagonal segments (rails bend in 90 degree steps only):", len(diag))
 for d in diag[:8]:
     print("   ", d)
 
+# junction connectivity: every stretch end referencing one node must land on
+# the same cell, otherwise the map shows the lines as unconnected there
+import math as _math
+from collections import defaultdict
+ends = defaultdict(list)
+for st in stretches:
+    ends[st["frm"]].append(tuple(st["path"][0]))
+    ends[st["dst"]].append(tuple(st["path"][-1]))
+gaps = []
+for nid, pos in ends.items():
+    if len(pos) < 2:
+        continue
+    spread = max(_math.dist(a, b) for a in pos for b in pos)
+    if spread > 0.01:
+        gaps.append((nid, len(pos), round(spread, 1), pos))
+print("junctions whose ends do not meet:", len(gaps))
+for g in gaps:
+    print("   ", g)
+
 multi = [(s["eid"], s["lanes"], len(s["path"])) for s in stretches if s["lanes"] > 1]
 print("stretches that collapsed >1 row:", len(multi), multi[:8])
 

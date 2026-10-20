@@ -254,6 +254,9 @@ def build_stretches(edge_list, node_coords=None, snap_cap=4.0):
         return []
 
     anchors = infer_node_anchors(edge_list) if node_coords is None else node_coords
+    recorded = set()
+    for e in edge_list:
+        recorded.update(map(tuple, e["cells"]))
 
     out = []
     for members in sorted(groups, key=lambda g: min(e["eid"] for e in g)):
@@ -263,15 +266,32 @@ def build_stretches(edge_list, node_coords=None, snap_cap=4.0):
             anchor = anchors.get(nid)
             if not anchor or len(path) < 2:
                 continue
-            # Rails only bend in 90 degree steps. Accept an anchor only when the
-            # junction segment stays axis-aligned; an anchor sitting diagonally
-            # next to the end cell would paint a fake 45 degree kink where the
-            # line meets the junction. Keep the recorded cell in that case.
+            if math.dist(path[end], anchor) > snap_cap:
+                continue
             neighbour = path[1] if end == 0 else path[-2]
             if (abs(anchor[0] - neighbour[0]) > 0.5
                     and abs(anchor[2] - neighbour[2]) > 0.5):
-                continue
-            if math.dist(path[end], anchor) <= snap_cap:
+                # The anchor sits diagonally next to the end cell. A direct snap
+                # would paint a 45 degree kink that no rail can produce, so walk
+                # the corner instead: the connection stays 90 degrees and the
+                # line still reaches the junction. Prefer a corner cell that is
+                # real recorded track; otherwise continue the line's own axis.
+                ex, ey, ez = path[end]
+                prefer = 0 if abs(neighbour[0] - ex) > 0.5 else 1
+                corners = [(anchor[0], ey, ez), (ex, ey, anchor[2])]
+                corner = None
+                for i in (prefer, 1 - prefer):
+                    if corners[i] in recorded:
+                        corner = corners[i]
+                        break
+                if corner is None:
+                    corner = corners[prefer]
+                bridge = [] if tuple(corner) == tuple(anchor) else [list(corner)]
+                if end == 0:
+                    path[:0] = [list(anchor)] + bridge
+                else:
+                    path.extend(bridge + [list(anchor)])
+            elif math.dist(path[end], anchor) > 0.01:
                 path[end] = list(anchor)
         deduped = [path[0]]
         for cell in path[1:]:

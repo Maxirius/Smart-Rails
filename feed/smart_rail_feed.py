@@ -7,7 +7,9 @@ container and regenerates:
 
   * one BlueMap marker file PER MAP at map_app/maps/<mapid>/live/markers.json
     (the webapp resolves its marker file as "<liveDataRoot>/<mapid>/live/
-    markers.json" -- verified against the shipped frontend bundle), and
+    markers.json" -- verified against the shipped frontend bundle). Each file
+    carries the rail network plus the community waypoints the website stores
+    in smartrail.waypoints, and
   * a slim network.json for the welcome page's rail-network view.
 
 Coordinate contract (verified in the frontend bundle): marker "position" is an
@@ -15,15 +17,19 @@ OBJECT {x,y,z}, and every entry of a line marker's "line" array is an OBJECT
 {x,y,z} as well -- arrays are silently read as {0,0,0} and collapse the
 geometry to the origin.
 
-Writes are atomic (tmp + rename) and preserve the previous artifact when the
-source tables are empty for a map, so a transient DB outage never blanks the
-map.
+Writes are atomic (tmp + rename). A database read failure exits before any
+write, so an outage preserves the previous artifacts. Every known map is
+written on every run: dropping a map from the payload (e.g. after the last
+waypoint of a dimension was deleted) would leave the previous file -- with
+the deleted pin still in it -- in place.
 """
 
+import collections
+import html
 import json
 import math
-import collections
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -116,44 +122,154 @@ def atomic_write(path, text):
     os.rename(tmp, path)
 
 
-def build_stretches(edge_list, node_coords=None):
+# ---------------------------------------------------------------------------
+# Community waypoints (set on the website, stored in smartrail.waypoints)
+# ---------------------------------------------------------------------------
+
+WP_DEFAULT_COLOR = "#77cf52"
+
+# One pin for a waypoint. Keep the SVG path and inline styles in sync with the
+# client-side preview pin in map_app/js/waypoints.js -- the preview is meant
+# to be visually indistinguishable from the server-rendered marker.
+PIN_SVG = ('<svg width="18" height="24" viewBox="0 0 18 24" aria-hidden="true">'
+           '<path d="M9 0C4.03 0 0 4.03 0 9c0 6.6 9 15 9 15s9-8.4 9-15c0-4.97-4.03-9-9-9z" '
+           'fill="%s" stroke="#101418" stroke-width="1" stroke-linejoin="round"/>'
+           '<circle cx="9" cy="9" r="3.2" fill="#101418"/></svg>')
+
+WP_ANCHOR = {"x": 9, "y": 24}
+
+
+def wp_esc(text):
+    return html.escape(str(text), quote=True)
+
+
+def wp_pin_html(name, color):
+    col = color if re.fullmatch(r"#[0-9a-fA-F]{6}", color or "") else WP_DEFAULT_COLOR
+    return ('<div style="display:flex;flex-direction:column;align-items:center;'
+            'cursor:pointer">' + PIN_SVG % col
+            + '<span style="font:bold 12px sans-serif;color:%s;white-space:nowrap;'
+              'text-shadow:0 0 4px #000,0 0 4px #000">%s</span></div>'
+              % (col, wp_esc(name)))
+
+
+def read_waypoints(env):
+    """Rows from smartrail.waypoints; [] until the website created the table.
+
+    A missing table (MariaDB error 1146) is a normal pre-deployment state and
+    must never stop the rail feed.
+    """
+    try:
+        out = query("SELECT id,dim,name,x,y,z,color,owner FROM waypoints;", env)
+    except RuntimeError as exc:
+        if "1146" in str(exc) or "doesn't exist" in str(exc):
+            return []
+        raise
+    wps = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = (line.split("\t") + [""] * 8)[:8]
+        wid, dim, name, x, y, z, color, owner = parts
+        try:
+            wps.append({"id": int(wid), "dim": dim, "name": name or "?",
+                        "x": int(x), "y": int(y), "z": int(z),
+                        "color": color or WP_DEFAULT_COLOR, "owner": owner or ""})
+        except ValueError:
+            continue
+    return wps
+
+
+def infer_node_anchors(edge_list):
+    """Node position inferred from the geometry itself.
+
+    The endpoint cell that most edges referencing a node id agree on. The nodes
+    table has proven unreliable for this purpose: it is missing ids that the
+    edges reference (18..27) and holds stale coordinates for others, so snapping
+    to it dragged stretch ends across the map (up to 52 blocks, seen 10/26).
+    The cells are the physical truth; use them.
+    """
+    counters = {}
+    for e in edge_list:
+        if not e["cells"]:
+            continue
+        counters.setdefault(e["frm"], collections.Counter())[tuple(e["cells"][0])] += 1
+        counters.setdefault(e["dst"], collections.Counter())[tuple(e["cells"][-1])] += 1
+    return {nid: list(c.most_common(1)[0][0]) for nid, c in counters.items()}
+
+
+def _cluster_lanes(edge_list):
+    """Group edges that describe the SAME physical track.
+
+    Original rule was the node pair (frm, dst), which breaks as soon as a graph
+    rebuild leaves a second generation of rows behind: the same track then
+    appears twice with different ids and was drawn twice, a block apart. Group
+    by geometry instead -- cell sets that agree apart from the ends (lanes of
+    one track) or where one is contained in the other (partial re-recordings).
+    """
+    sets = [set(map(tuple, e["cells"])) for e in edge_list]
+    parent = list(range(len(edge_list)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            a, b = (i, j) if len(sets[i]) <= len(sets[j]) else (j, i)
+            lo, hi = len(sets[a]), len(sets[b])
+            if lo < 2:
+                continue
+            inter = len(sets[a] & sets[b])
+            lanes = inter >= max(2, lo - 1) and lo >= 0.5 * hi
+            contained = inter >= max(3, lo) and hi >= lo
+            if lanes or contained:
+                union(i, j)
+
+    groups = {}
+    for i, e in enumerate(edge_list):
+        groups.setdefault(find(i), []).append(e)
+    return [g for g in groups.values() if any(len(e["cells"]) >= 2 for e in g)]
+
+
+def build_stretches(edge_list, node_coords=None, snap_cap=4.0):
     """Collapse the per-direction lane edges into one PHYSICAL stretch.
 
     Right-hand traffic stores one edge per direction for the same piece of track
-    (14 of them in the reference network) and those lanes are not parallel rails:
-    they overlap cell for cell and differ by about one cell at the ends. The
-    stretch therefore keeps the geometry of its LONGEST lane verbatim -- the line
-    sits exactly on the rails, no lateral offset -- and snaps only its two end
-    cells onto the junction anchor (the anchor cell most edges agree on), so
-    neighbouring stretches meet exactly at the crossing.
+    and those lanes are not parallel rails: they overlap cell for cell and differ
+    by about one cell at the ends (the same applies to rows left over from an
+    earlier graph build). The stretch keeps the geometry of its LONGEST member
+    verbatim -- the line sits exactly on the rails, no lateral offset -- and
+    snaps only its two end cells onto the node anchor, never more than
+    snap_cap blocks: a stale node row must not drag an end across the map.
     """
-    groups = {}
-    for e in edge_list:
-        if len(e["cells"]) >= 2:
-            groups.setdefault((min(e["frm"], e["dst"]), max(e["frm"], e["dst"])), []).append(e)
+    groups = _cluster_lanes(edge_list)
     if not groups:
         return []
 
-    if node_coords is None:
-        counters = {}
-        for e in edge_list:
-            if not e["cells"]:
-                continue
-            counters.setdefault(e["frm"], collections.Counter())[tuple(e["cells"][0])] += 1
-            counters.setdefault(e["dst"], collections.Counter())[tuple(e["cells"][-1])] += 1
-        node_coords = {nid: list(c.most_common(1)[0][0]) for nid, c in counters.items()}
-    else:
-        node_coords = {nid: list(c) for nid, c in node_coords.items()}
+    anchors = infer_node_anchors(edge_list) if node_coords is None else node_coords
 
     out = []
-    for _, lanes in sorted(groups.items()):
-        base = min(lanes, key=lambda l: (-len(l["cells"]), l["eid"]))
+    for members in sorted(groups, key=lambda g: min(e["eid"] for e in g)):
+        base = min(members, key=lambda l: (-len(l["cells"]), l["eid"]))
         path = [list(c) for c in base["cells"]]
-        path[0] = list(node_coords.get(base["frm"], path[0]))
-        path[-1] = list(node_coords.get(base["dst"], path[-1]))
+        for end, nid in ((0, base["frm"]), (-1, base["dst"])):
+            anchor = anchors.get(nid)
+            if anchor and math.dist(path[end], anchor) <= snap_cap:
+                path[end] = list(anchor)
+        deduped = [path[0]]
+        for cell in path[1:]:
+            if cell != deduped[-1]:
+                deduped.append(cell)
         out.append({"eid": base["eid"], "frm": base["frm"], "dst": base["dst"],
-                    "path": path, "lanes": len(lanes),
-                    "len": max(l["len"] for l in lanes), "arm": base["arm"]})
+                    "path": deduped, "lanes": len(members),
+                    "len": max(l["len"] for l in members), "arm": base["arm"]})
     return out
 
 
@@ -198,16 +314,30 @@ def main():
 
     stamp = int(datetime.now(timezone.utc).timestamp())
 
+    waypoints = read_waypoints(env)
+
     # -------- BlueMap markers, grouped per map --------
-    per_map = {}   # mapid -> {"tracks": {class: [...]}, "stations": [...]}
+    # Every known map is seeded: files are written unconditionally so that a
+    # map emptying out (last waypoint deleted) is rewritten and the stale pin
+    # disappears. A failed db read exits before any write, so this never
+    # blanks a map during an outage.
+    per_map = {mp: {"tracks": [], "stations": [], "waypoints": []}
+               for mp in DIM_TO_MAP.values()}
+
+    for w in waypoints:
+        mp = DIM_TO_MAP.get(w["dim"])
+        if mp:
+            per_map[mp]["waypoints"].append(w)
 
     for dim, edim in edges.items():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        bucket = per_map.setdefault(mp, {"tracks": [], "stations": []})
-        coords = {n["nid"]: (n["x"], n["y"], n["z"]) for n in nodes.get(dim, [])}
-        stretches = build_stretches(edim, coords)
+        bucket = per_map[mp]
+        # Anchors come from the CELLS, not from the nodes table: the table has
+        # been unreliable (stale rows / ids the edges use but it lacks), and a
+        # bad anchor used to drag a stretch end across the map.
+        stretches = build_stretches(edim)
         stands = [n for n in nodes.get(dim, []) if n["kind"] in ("station", "cargo")]
         for st in stretches:
             cells = st["path"]
@@ -234,15 +364,19 @@ def main():
         mp = DIM_TO_MAP.get(dim)
         if not mp:
             continue
-        bucket = per_map.setdefault(mp, {"tracks": [], "stations": []})
+        bucket = per_map[mp]
+        anchors = infer_node_anchors(edges.get(dim, []))
         for n in ndim:
             if n["kind"] not in ("station", "cargo"):
                 continue
             typ = "gueter" if n["kind"] == "cargo" else "person"
             col = STATION_COLOR["cargo" if n["kind"] == "cargo" else "station"]
+            # Prefer the anchor the track actually ends on, so the pin sits on
+            # the line even when the nodes table row is off by a block or two.
+            ax, ay, az = anchors.get(n["nid"], (n["x"], n["y"], n["z"]))
             bucket["stations"].append({
                 "id": "st-%s-%d" % (typ, n["nid"]), "type": "html", "map": mp,
-                "position": vec(n["x"] + 0.5, n["y"] + 2.2, n["z"] + 0.5),
+                "position": vec(ax + 0.5, ay + 2.2, az + 0.5),
                 "label": n["name"] or "?",
                 "html": ("<div style=\"font:bold 13px sans-serif;color:%s;"
                          "white-space:nowrap;text-shadow:0 0 4px #000,"
@@ -272,14 +406,31 @@ def main():
                 "id": "smartrail-tracks", "label": "Smart Rails \u00b7 Gleisnetz",
                 "toggleable": True, "defaultHidden": False, "sorting": 10,
                 "markers": by_id(bucket["tracks"])}
-        payload["smartrail-stations"] = {
-            "id": "smartrail-stations", "label": "Smart Rails \u00b7 Stationen",
-            "toggleable": True, "defaultHidden": False, "sorting": 20,
-            "markers": by_id(sorted(bucket["stations"], key=lambda m: m["id"]))}
+        if bucket["stations"]:
+            payload["smartrail-stations"] = {
+                "id": "smartrail-stations", "label": "Smart Rails \u00b7 Stationen",
+                "toggleable": True, "defaultHidden": False, "sorting": 20,
+                "markers": by_id(sorted(bucket["stations"], key=lambda m: m["id"]))}
+        if bucket["waypoints"]:
+            payload["waypoints"] = {
+                "id": "waypoints", "label": "Waypoints",
+                "toggleable": True, "defaultHidden": False, "sorting": 30,
+                "markers": by_id(sorted(
+                    ({"id": "wp-%d" % w["id"], "type": "html", "map": mp,
+                      "position": vec(w["x"] + 0.5, w["y"], w["z"] + 0.5),
+                      "label": w["name"],
+                      "detail": "von %s \u00b7 %d/%d/%d" % (
+                          wp_esc(w["owner"]) or "?", w["x"], w["y"], w["z"]),
+                      "html": wp_pin_html(w["name"], w["color"]),
+                      "anchor": dict(WP_ANCHOR),
+                      "listed": True, "classes": []}
+                     for w in bucket["waypoints"]),
+                    key=lambda m: m["id"]))}
         atomic_write(os.path.join(MAP_APP_DIR, "maps", mp, "live", "markers.json"),
                      json.dumps(payload, separators=(",", ":")))
-        written_maps.append("%s(%d/%d)" % (
-            mp, len(bucket["tracks"]), len(bucket["stations"])))
+        written_maps.append("%s(%d/%d/+%d)" % (
+            mp, len(bucket["tracks"]), len(bucket["stations"]),
+            len(bucket["waypoints"])))
 
     # -------- Slim site feed --------
     feed = {"generatedUtc": stamp, "dims": {}}
@@ -304,8 +455,10 @@ def main():
 
     total_tracks = sum(len(b["tracks"]) for b in per_map.values())
     total_stations = sum(len(b["stations"]) for b in per_map.values())
-    print("feed ok utc=%d maps=%s total_tracks=%d total_stations=%d" % (
-        stamp, ",".join(written_maps) or "-", total_tracks, total_stations))
+    total_waypoints = sum(len(b["waypoints"]) for b in per_map.values())
+    print("feed ok utc=%d maps=%s total_tracks=%d total_stations=%d total_waypoints=%d" % (
+        stamp, ",".join(written_maps) or "-", total_tracks, total_stations,
+        total_waypoints))
 
 
 if __name__ == "__main__":

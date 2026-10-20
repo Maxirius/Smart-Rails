@@ -261,7 +261,17 @@ def build_stretches(edge_list, node_coords=None, snap_cap=4.0):
         path = [list(c) for c in base["cells"]]
         for end, nid in ((0, base["frm"]), (-1, base["dst"])):
             anchor = anchors.get(nid)
-            if anchor and math.dist(path[end], anchor) <= snap_cap:
+            if not anchor or len(path) < 2:
+                continue
+            # Rails only bend in 90 degree steps. Accept an anchor only when the
+            # junction segment stays axis-aligned; an anchor sitting diagonally
+            # next to the end cell would paint a fake 45 degree kink where the
+            # line meets the junction. Keep the recorded cell in that case.
+            neighbour = path[1] if end == 0 else path[-2]
+            if (abs(anchor[0] - neighbour[0]) > 0.5
+                    and abs(anchor[2] - neighbour[2]) > 0.5):
+                continue
+            if math.dist(path[end], anchor) <= snap_cap:
                 path[end] = list(anchor)
         deduped = [path[0]]
         for cell in path[1:]:

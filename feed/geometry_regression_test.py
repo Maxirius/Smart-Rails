@@ -48,6 +48,7 @@ print("edges in: %d  ->  stretches drawn: %d" % (len(edges), len(stretches)))
 
 steps = Counter()
 bad = []
+diag = []
 for st in stretches:
     p = st["path"]
     for i in range(1, len(p)):
@@ -56,10 +57,15 @@ for st in stretches:
         steps[s] += 1
         if s > 5:
             bad.append((st["eid"], i, s, tuple(p[i - 1]), tuple(p[i])))
+        if p[i][0] != p[i - 1][0] and p[i][2] != p[i - 1][2]:
+            diag.append((st["eid"], i, tuple(p[i - 1]), tuple(p[i])))
 print("step-size histogram:", dict(sorted(steps.items())))
 print("steps > 5 blocks (chords):", len(bad))
 for b in bad[:8]:
     print("   ", b)
+print("diagonal segments (rails bend in 90 degree steps only):", len(diag))
+for d in diag[:8]:
+    print("   ", d)
 
 multi = [(s["eid"], s["lanes"], len(s["path"])) for s in stretches if s["lanes"] > 1]
 print("stretches that collapsed >1 row:", len(multi), multi[:8])
